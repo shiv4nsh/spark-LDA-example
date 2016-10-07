@@ -1,6 +1,9 @@
 package org.apache.spark.examples.mllib
 
+import edu.stanford.nlp.process.Morphology
+import edu.stanford.nlp.simple.Document
 import org.apache.log4j.{Level, Logger}
+import scala.collection.JavaConversions._
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.ml.Pipeline
@@ -11,24 +14,24 @@ import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SparkSession}
 
-object LDAExample {
 
-  private case class Params(
-                             input: Seq[String] = Seq.empty,
-                             k: Int = 20,
-                             maxIterations: Int = 10,
-                             docConcentration: Double = -1,
-                             topicConcentration: Double = -1,
-                             vocabSize: Int = 2900000,
-                             stopwordFile: String = "",
-                             algorithm: String = "em",
-                             checkpointDir: Option[String] = None,
-                             checkpointInterval: Int = 10)
+case class Params(
+                   input: String = "",
+                   k: Int = 20,
+                   maxIterations: Int = 10,
+                   docConcentration: Double = -1,
+                   topicConcentration: Double = -1,
+                   vocabSize: Int = 2900000,
+                   stopwordFile: String = "",
+                   algorithm: String = "em",
+                   checkpointDir: Option[String] = None,
+                   checkpointInterval: Int = 10)
 
-  def main(args: Array[String]) {
-    val defaultParams = Params().copy(input = new java.io.File("/home/shivansh/out").listFiles().map(_.getPath))
-    run(defaultParams)
-  }
+object LDAExample extends App {
+
+  val defaultParams = Params().copy(input = "src/main/resources/docs/")
+  run(defaultParams)
+
 
   private def run(params: Params): Unit = {
     val conf = new SparkConf().setAppName(s"LDAExample").setMaster("local[*]")
@@ -104,6 +107,10 @@ object LDAExample {
     sc.stop()
   }
 
+  import org.apache.spark.sql.functions._
+
+
+
   /**
     * Load documents, tokenize them, create vocabulary, and prepare documents as term count vectors.
     *
@@ -111,49 +118,37 @@ object LDAExample {
     */
   private def preprocess(
                           sc: SparkContext,
-                          paths: Seq[String],
+                          paths: String,
                           vocabSize: Int,
                           stopwordFile: String): (RDD[(Long, Vector)], Array[String], Long) = {
 
-    val spark = SparkSession
-      .builder
-      .sparkContext(sc)
-      .getOrCreate()
+    val spark = SparkSession.builder.sparkContext(sc).getOrCreate()
     import spark.implicits._
-
-    // Get dataset of document texts
-    // One document per line in each text file. If the input consists of many small files,
-    // this can result in a large number of small partitions, which can degrade performance.
-    // In this case, consider using coalesce() to create fewer, larger partitions.
-    val df = sc.textFile(paths.mkString(",")).toDF("docs")
+    //Reading the Whole Text Files
+    val df = sc.wholeTextFiles(paths).map(_._2).filter(a => Option(a).isDefined && !a.isEmpty).map(LDAHelper.filterSpecialCharacters).toDF("docs")
     val customizedStopWords: Array[String] = if (stopwordFile.isEmpty) {
       Array.empty[String]
     } else {
       val stopWordText = sc.textFile(stopwordFile).collect()
       stopWordText.flatMap(_.stripMargin.split("\\s+"))
     }
-    val tokenizer = new RegexTokenizer()
-      .setInputCol("docs")
-      .setOutputCol("rawTokens")
-    val stopWordsRemover = new StopWordsRemover()
-      .setInputCol("rawTokens")
-      .setOutputCol("tokens")
-    stopWordsRemover.setStopWords(stopWordsRemover.getStopWords ++ customizedStopWords)
-    val countVectorizer = new CountVectorizer()
-      .setVocabSize(vocabSize)
-      .setInputCol("tokens")
-      .setOutputCol("features")
+    //Tokenizing using the RegexTokenizer
+    val tokenizer = new RegexTokenizer().setInputCol("docs").setOutputCol("rawTokens")
 
-    val pipeline = new Pipeline()
-      .setStages(Array(tokenizer, stopWordsRemover, countVectorizer))
+    //Removing the Stop-words using the Stop Words remover
+    val stopWordsRemover = new StopWordsRemover().setInputCol("rawTokens").setOutputCol("tokens")
+    stopWordsRemover.setStopWords(stopWordsRemover.getStopWords ++ customizedStopWords)
+
+    //Converting the Tokens into the CountVector
+    val countVectorizer = new CountVectorizer().setVocabSize(vocabSize).setInputCol("tokens").setOutputCol("features")
+
+    //Setting up the pipeline
+    val pipeline = new Pipeline().setStages(Array(tokenizer, stopWordsRemover, countVectorizer))
 
     val model = pipeline.fit(df)
-    val documents = model.transform(df)
-      .select("features")
-      .rdd
-      .map { case Row(features: MLVector) => Vectors.fromML(features) }
-      .zipWithIndex()
-      .map(_.swap)
+    val documents = model.transform(df).select("features").rdd.map {
+      case Row(features: MLVector) => Vectors.fromML(features)
+    }.zipWithIndex().map(_.swap)
 
     (documents,
       model.stages(2).asInstanceOf[CountVectorizerModel].vocabulary, // vocabulary
@@ -161,4 +156,21 @@ object LDAExample {
   }
 }
 
-// scalastyle:on println
+object LDAHelper {
+
+  def filterSpecialCharacters(document: String) = document.replaceAll("[! @ # $ % ^ & * ( ) _ + - − , ; :]", " ")
+
+  def getSentencesFromDocument(document: String) = new Document(document).sentences().toList.map(_.text())
+
+  def generateStemmedRDD(document: RDD[Seq[String]]): RDD[Seq[String]] = {
+    document.mapPartitions { partitions =>
+      val morphology = new Morphology()
+      partitions.map {
+        _.filter(a => Option(a).isDefined && !a.isEmpty).map { word =>
+          morphology.stem(word)
+        }
+      }
+    }
+  }
+}
+
