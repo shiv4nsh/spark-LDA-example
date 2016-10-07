@@ -7,7 +7,7 @@ import scala.collection.JavaConversions._
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.ml.Pipeline
-import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel, RegexTokenizer, StopWordsRemover}
+import org.apache.spark.ml.feature._
 import org.apache.spark.ml.linalg.{Vector => MLVector}
 import org.apache.spark.mllib.clustering.{DistributedLDAModel, EMLDAOptimizer, LDA, OnlineLDAOptimizer}
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
@@ -17,12 +17,12 @@ import org.apache.spark.sql.{Row, SparkSession}
 
 case class Params(
                    input: String = "",
-                   k: Int = 20,
+                   k: Int = 5,
                    maxIterations: Int = 10,
                    docConcentration: Double = -1,
                    topicConcentration: Double = -1,
                    vocabSize: Int = 2900000,
-                   stopwordFile: String = "",
+                   stopwordFile: String = "src/main/resources/stopWords.txt",
                    algorithm: String = "em",
                    checkpointDir: Option[String] = None,
                    checkpointInterval: Int = 10)
@@ -92,7 +92,7 @@ object LDAExample extends App {
     }
 
     // Print the topics, showing the top-weighted terms for each topic.
-    val topicIndices = ldaModel.describeTopics(maxTermsPerTopic = 10)
+    val topicIndices = ldaModel.describeTopics(maxTermsPerTopic = 20)
     val topics = topicIndices.map { case (terms, termWeights) =>
       terms.zip(termWeights).map { case (term, weight) => (vocabArray(term.toInt), weight) }
     }
@@ -110,7 +110,6 @@ object LDAExample extends App {
   import org.apache.spark.sql.functions._
 
 
-
   /**
     * Load documents, tokenize them, create vocabulary, and prepare documents as term count vectors.
     *
@@ -125,12 +124,12 @@ object LDAExample extends App {
     val spark = SparkSession.builder.sparkContext(sc).getOrCreate()
     import spark.implicits._
     //Reading the Whole Text Files
-    val df = sc.wholeTextFiles(paths).map(_._2).filter(a => Option(a).isDefined && !a.isEmpty).map(LDAHelper.filterSpecialCharacters).toDF("docs")
+    val df = sc.wholeTextFiles(paths).map(_._2).map(LDAHelper.getLemmaText).map(LDAHelper.filterSpecialCharacters).toDF("docs")
     val customizedStopWords: Array[String] = if (stopwordFile.isEmpty) {
       Array.empty[String]
     } else {
       val stopWordText = sc.textFile(stopwordFile).collect()
-      stopWordText.flatMap(_.stripMargin.split("\\s+"))
+      stopWordText.flatMap(_.stripMargin.split(","))
     }
     //Tokenizing using the RegexTokenizer
     val tokenizer = new RegexTokenizer().setInputCol("docs").setOutputCol("rawTokens")
@@ -158,19 +157,21 @@ object LDAExample extends App {
 
 object LDAHelper {
 
-  def filterSpecialCharacters(document: String) = document.replaceAll("[! @ # $ % ^ & * ( ) _ + - − , ; :]", " ")
+  def filterSpecialCharacters(document: String) = document.replaceAll("""[! @ # $ % ^ & * ( ) _ + - − , " ' ; : . ` ? --]""", " ")
 
-  def getSentencesFromDocument(document: String) = new Document(document).sentences().toList.map(_.text())
+  def getStemmedText(document: String) = {
+    val morphology = new Morphology()
+    new Document(document).sentences().toList.flatMap(_.words().toList.map(morphology.stem)).mkString(" ")
+  }
 
-  def generateStemmedRDD(document: RDD[Seq[String]]): RDD[Seq[String]] = {
-    document.mapPartitions { partitions =>
-      val morphology = new Morphology()
-      partitions.map {
-        _.filter(a => Option(a).isDefined && !a.isEmpty).map { word =>
-          morphology.stem(word)
-        }
+  def getLemmaText(document: String) = {
+    val morphology = new Morphology()
+    new Document(document).sentences().toList.flatMap { a =>
+      (a.words().toList zip a.posTags().toList).map { a =>
+        val newWord = morphology.lemma(a._1, a._2)
+        newWord
       }
-    }
+    }.mkString(" ")
   }
 }
 
