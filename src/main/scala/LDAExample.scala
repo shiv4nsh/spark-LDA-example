@@ -1,4 +1,3 @@
-package org.apache.spark.examples.mllib
 
 import edu.stanford.nlp.process.Morphology
 import edu.stanford.nlp.simple.Document
@@ -27,16 +26,9 @@ case class Params(
                    checkpointDir: Option[String] = None,
                    checkpointInterval: Int = 10)
 
-object LDAExample extends App {
+class LDAExample(sc: SparkContext, spark: SparkSession) {
 
-  val defaultParams = Params().copy(input = "src/main/resources/docs/")
-  run(defaultParams)
-
-
-  private def run(params: Params): Unit = {
-    val conf = new SparkConf().setAppName(s"LDAExample").setMaster("local[*]")
-    val spark = SparkSession.builder().config(conf).getOrCreate()
-    val sc = spark.sparkContext
+  def run(params: Params): Unit = {
 
     Logger.getRootLogger.setLevel(Level.WARN)
 
@@ -44,11 +36,10 @@ object LDAExample extends App {
     val preprocessStart = System.nanoTime()
     val (corpus, vocabArray, actualNumTokens) =
       preprocess(sc, params.input, params.vocabSize, params.stopwordFile)
-    corpus.cache()
     val actualCorpusSize = corpus.count()
     val actualVocabSize = vocabArray.length
     val preprocessElapsed = (System.nanoTime() - preprocessStart) / 1e9
-
+    corpus.cache()
     println()
     println(s"Corpus summary:")
     println(s"\t Training set size: $actualCorpusSize documents")
@@ -115,16 +106,25 @@ object LDAExample extends App {
     *
     * @return (corpus, vocabulary as array, total token count in corpus)
     */
-  private def preprocess(
-                          sc: SparkContext,
-                          paths: String,
-                          vocabSize: Int,
-                          stopwordFile: String): (RDD[(Long, Vector)], Array[String], Long) = {
+  def preprocess(
+                  sc: SparkContext,
+                  paths: String,
+                  vocabSize: Int,
+                  stopwordFile: String): (RDD[(Long, Vector)], Array[String], Long) = {
 
-    val spark = SparkSession.builder.sparkContext(sc).getOrCreate()
     import spark.implicits._
     //Reading the Whole Text Files
-    val df = sc.wholeTextFiles(paths).map(_._2).map(LDAHelper.getLemmaText).map(LDAHelper.filterSpecialCharacters).toDF("docs")
+    val initialrdd = spark.sparkContext.wholeTextFiles(paths).map(_._2)
+    initialrdd.cache()
+    val rdd = initialrdd.mapPartitions { partition =>
+      val morphology = new Morphology()
+      partition.map { value =>
+        LDAHelper.getLemmaText(value, morphology)
+      }
+    }.map(LDAHelper.filterSpecialCharacters)
+    rdd.cache()
+    initialrdd.unpersist()
+    val df = rdd.toDF("docs")
     val customizedStopWords: Array[String] = if (stopwordFile.isEmpty) {
       Array.empty[String]
     } else {
@@ -155,6 +155,16 @@ object LDAExample extends App {
   }
 }
 
+object LDAExample extends App {
+
+  val conf = new SparkConf().setAppName(s"LDAExample").setMaster("local[*]").set("spark.executor.memory", "2g")
+  val spark = SparkSession.builder().config(conf).getOrCreate()
+  val sc = spark.sparkContext
+  val lda = new LDAExample(sc, spark)
+  val defaultParams = Params().copy(input = "src/main/resources/docs/")
+  lda.run(defaultParams)
+}
+
 object LDAHelper {
 
   def filterSpecialCharacters(document: String) = document.replaceAll("""[! @ # $ % ^ & * ( ) _ + - − , " ' ; : . ` ? --]""", " ")
@@ -164,14 +174,22 @@ object LDAHelper {
     new Document(document).sentences().toList.flatMap(_.words().toList.map(morphology.stem)).mkString(" ")
   }
 
-  def getLemmaText(document: String) = {
-    val morphology = new Morphology()
-    new Document(document).sentences().toList.flatMap { a =>
-      (a.words().toList zip a.posTags().toList).map { a =>
+  def getLemmaText(document: String, morphology: Morphology) = {
+    val string = new StringBuilder()
+    val value = new Document(document).sentences().toList.flatMap { a =>
+      val words = a.words().toList
+      val tags = a.posTags().toList
+      (words zip tags).toMap.map { a =>
         val newWord = morphology.lemma(a._1, a._2)
-        newWord
+        val addedWoed = if (newWord.length > 3) {
+          newWord
+        } else {
+          ""
+        }
+        string.append(addedWoed + " ")
       }
-    }.mkString(" ")
+    }
+    string.toString()
   }
 }
 
